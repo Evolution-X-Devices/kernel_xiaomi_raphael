@@ -1,0 +1,1 @@
+source "drivers/input/touchscreen/xiaomi/goodix_driver_gt9886/Kconfig"

@@ -40,6 +40,18 @@
 	status = "disabled";
 };
 
+/*
+ * The NPU's DDR bandwidth devfreq votes without a tag, i.e. in every RPMh
+ * set including SLEEP, and the bw_hwmon governor pins it at the top OPP
+ * (8.3 GB/s) because the NPU never comes up to run the monitor. A DDR vote
+ * in the sleep set keeps DDR and LLCC clocked while the AP sleeps, which
+ * alone forbids AOSS deep sleep. The CPU bandwidth nodes in sm8150.dtsi
+ * already carry qcom,active-only; give the NPU one the same treatment.
+ */
+&npu_npu_ddr_bw {
+	qcom,active-only;
+};
+
 &kgsl_msm_iommu {
 	/*
 	 * An overlay cannot delete a base-tree property, so empty them instead:

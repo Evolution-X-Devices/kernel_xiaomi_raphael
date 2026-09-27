@@ -24,6 +24,7 @@
 #include <linux/sched/task.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/msm_ion_ids.h>
 
 #include "ion_private.h"
 
@@ -45,6 +46,14 @@ int ion_free(struct ion_buffer *buffer)
 }
 EXPORT_SYMBOL_GPL(ion_free);
 
+/*
+ * Legacy QSEECOM heap id, as still requested by some vendor userspace built
+ * against older ION headers (the Goodix FOD fingerprint HAL on sm8150 asks
+ * for 1 << 27). ION_QSECOM_HEAP_ID is ION_BIT(7) here, so no heap answers to
+ * bit 27 and the allocation fails with -ENODEV.
+ */
+#define ION_LEGACY_QSECOM_HEAP_ID	ION_BIT(27)
+
 static int ion_alloc_fd(size_t len, unsigned int heap_id_mask,
 			unsigned int flags)
 {
@@ -52,6 +61,19 @@ static int ion_alloc_fd(size_t len, unsigned int heap_id_mask,
 	struct dma_buf *dmabuf;
 
 	dmabuf = ion_dmabuf_alloc(internal_dev, len, heap_id_mask, flags);
+	/*
+	 * Only when no registered heap matched the mask at all: translate the
+	 * legacy QSEECOM bit to the real heap id and try once more. Masks that
+	 * match a real heap never get here, and kernel clients do not use this
+	 * path (ion_alloc() calls ion_dmabuf_alloc() directly).
+	 */
+	if (IS_ERR(dmabuf) && PTR_ERR(dmabuf) == -ENODEV &&
+	    (heap_id_mask & ION_LEGACY_QSECOM_HEAP_ID)) {
+		heap_id_mask = (heap_id_mask & ~ION_LEGACY_QSECOM_HEAP_ID) |
+			       ION_QSECOM_HEAP_ID;
+		dmabuf = ion_dmabuf_alloc(internal_dev, len, heap_id_mask,
+					  flags);
+	}
 	if (IS_ERR(dmabuf))
 		return PTR_ERR(dmabuf);
 

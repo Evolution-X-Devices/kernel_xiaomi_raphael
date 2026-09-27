@@ -17,8 +17,37 @@
 #include "xiaomi_sm8150-sde-display.dtsi"
 #include "../../qcom/sm8150-thermal-overlay.dtsi"
 
+/*
+ * Every device below is a clock consumer of GCC that never binds a driver on
+ * this kernel (console UART: CONFIG_SERIAL_MSM_GENI_CONSOLE is off; TSPP:
+ * not built; PCIe 0/1: no PCIe peripheral on any of these phones; the kgsl
+ * iommu node: kgsl reads it directly and asks for its clocks by other names).
+ * With of_devlink each of them leaves a device link to GCC in the
+ * "available" state, so the driver core never calls GCC's sync_state(), the
+ * boot-time maximum-corner votes on VDD_CX / VDD_MX / VDD_MMCX are never
+ * dropped, and the SoC can never enter AOSS deep sleep (soc_sleep aosd/cxsd/
+ * ddr counts stay 0). Cost: ~100 mA at idle. Take them out of the picture.
+ */
 &qupv3_se12_2uart {
-	status = "ok";
+	status = "disabled";
+};
+
+&pcie1 {
+	status = "disabled";
+};
+
+&tspp {
+	status = "disabled";
+};
+
+&kgsl_msm_iommu {
+	/*
+	 * An overlay cannot delete a base-tree property, so empty them instead:
+	 * no phandles, no device link. kgsl never asks this node for clocks by
+	 * these names anyway.
+	 */
+	clocks;
+	clock-names;
 };
 
 &vendor {
@@ -441,6 +470,8 @@
 
 &pcie0 {
 	qcom,no-l1-supported;
+	/* See the GCC sync_state note at the top of this file. */
+	status = "disabled";
 };
 
 &usb1 {

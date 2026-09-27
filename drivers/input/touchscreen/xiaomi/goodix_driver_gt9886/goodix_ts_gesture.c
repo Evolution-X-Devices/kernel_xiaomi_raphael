@@ -26,6 +26,9 @@
 #include <linux/platform_device.h>
 #include <linux/version.h>
 #include <linux/delay.h>
+#ifdef CONFIG_TOUCHSCREEN_COMMON
+#include <linux/input/tp_common.h>
+#endif
 #include <linux/input/mt.h>
 #include <asm/atomic.h>
 #include "goodix_ts_core.h"
@@ -463,6 +466,20 @@ static int gsx_gesture_ist(struct goodix_ts_core *core_data,
 					 ABS_MT_WIDTH_MINOR, overlapping_area);
 			/*input_report_abs(core_data->input_dev, ABS_MT_TOUCH_MINOR, area);*/
 
+			/*
+			 * This is the FOD press path while the panel is off; the
+			 * screen-off unlock sensor watches fp_state, so publish it
+			 * here too (the normal report path does the same). Only on
+			 * the first event of a press: the IC repeats it while held.
+			 */
+#ifdef CONFIG_TOUCHSCREEN_COMMON
+			if (!core_data->fod_pressed) {
+				core_data->fp_x = x;
+				core_data->fp_y = y;
+				core_data->fp_pressed = 1;
+				sysfs_notify(touchpanel_kobj, NULL, "fp_state");
+			}
+#endif
 			core_data->fod_pressed = true;
 			__set_bit(0, &core_data->touch_id);
 
@@ -504,6 +521,10 @@ static int gsx_gesture_ist(struct goodix_ts_core *core_data,
 						 BTN_TOOL_FINGER, 0);
 				input_sync(core_data->input_dev);
 				__clear_bit(0, &core_data->touch_id);
+#ifdef CONFIG_TOUCHSCREEN_COMMON
+				core_data->fp_pressed = 0;
+				sysfs_notify(touchpanel_kobj, NULL, "fp_state");
+#endif
 				core_data->fod_pressed = false;
 			}
 			core_data->sleep_finger = 0;

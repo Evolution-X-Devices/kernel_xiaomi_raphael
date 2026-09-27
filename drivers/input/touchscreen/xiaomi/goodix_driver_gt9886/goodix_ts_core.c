@@ -869,6 +869,14 @@ static int goodix_ts_input_report(struct input_dev *dev,
 	if ((core_data->event_status & 0x88) == 0x88 && core_data->fod_status) {
 		input_report_key(core_data->input_dev, BTN_INFO, 1);
 		/*input_report_key(core_data->input_dev, KEY_INFO, 1);*/
+#ifdef CONFIG_TOUCHSCREEN_COMMON
+		if (!core_data->fod_pressed) {
+			core_data->fp_x = coords->x;
+			core_data->fp_y = coords->y;
+			core_data->fp_pressed = 1;
+			sysfs_notify(touchpanel_kobj, NULL, "fp_state");
+		}
+#endif
 		core_data->fod_pressed = true;
 		ts_info("BTN_INFO press");
 	} else if (core_data->fod_pressed &&
@@ -878,6 +886,10 @@ static int goodix_ts_input_report(struct input_dev *dev,
 			/*input_report_key(core_data->input_dev, KEY_INFO, 0);*/
 			ts_info("BTN_INFO release");
 			core_data->fod_pressed = false;
+#ifdef CONFIG_TOUCHSCREEN_COMMON
+			core_data->fp_pressed = 0;
+			sysfs_notify(touchpanel_kobj, NULL, "fp_state");
+#endif
 		}
 	}
 	mutex_unlock(&ts_dev->report_mutex);
@@ -1256,6 +1268,24 @@ static ssize_t gtp_fod_status_store(struct kobject *kobj,
 static struct tp_common_ops fod_status_ops = {
 	.show = gtp_fod_status_show,
 	.store = gtp_fod_status_store,
+};
+
+/*
+ * /sys/touchpanel/fp_state: "x,y,pressed". Read by the userspace UDFPS
+ * sensor (hardware/xiaomi/sensors, sensors.udfps), which polls it with
+ * POLLPRI and turns a press into the wake-up "org.lineageos.sensor.udfps"
+ * event that drives screen-off fingerprint unlock. Updated wherever
+ * BTN_INFO is reported, so it also works while the panel is off.
+ */
+static ssize_t gtp_fp_state_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "%d,%d,%d\n", goodix_core_data->fp_x,
+			goodix_core_data->fp_y, goodix_core_data->fp_pressed);
+}
+
+static struct tp_common_ops fp_state_ops = {
+	.show = gtp_fp_state_show,
 };
 #endif
 
@@ -2287,6 +2317,10 @@ static int goodix_ts_probe(struct platform_device *pdev)
 	r = tp_common_set_fod_status_ops(&fod_status_ops);
 	if (r < 0) {
 		ts_err("Failed to create fod_status node err=%d\n", r);
+	}
+	r = tp_common_set_fp_state_ops(&fp_state_ops);
+	if (r < 0) {
+		ts_err("Failed to create fp_state node err=%d\n", r);
 	}
 #endif
 

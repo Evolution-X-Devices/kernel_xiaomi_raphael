@@ -472,6 +472,10 @@ struct goodix_ts_core {
 	int fod_status;
 	int aod_status;
 	int fod_pressed;
+	/* last FOD press, published via /sys/touchpanel/fp_state */
+	int fp_x;
+	int fp_y;
+	int fp_pressed;
 	int fod_test;
 	int double_wakeup;
 	int result_type;

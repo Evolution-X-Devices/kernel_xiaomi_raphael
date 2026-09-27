@@ -790,6 +790,22 @@ And public attribution of xiaomi platforms(like F1 and so and)
 	status = "disabled";
 };
 
+/*
+ * raphael has one single-colour notification LED (its colour follows the
+ * phone's body colour). Both remaining LPG channels drive that same LED, green
+ * being the brighter one. The lights HAL and the stock init scripts expect a
+ * single LED named "white"; the blue channel must go away entirely, because
+ * the HAL otherwise builds a blue-only "RGB" device from it, lists that first,
+ * and battery/notification colours end up on a channel that cannot show them.
+ */
+&green_led {
+	label = "white";
+};
+
+&blue_led {
+	status = "disabled";
+};
+
 &pm8150l_wled {
 	qcom,string-cfg= <15>;// if use 2 string, the number is 3
 	qcom,leds-per-string = <5>;

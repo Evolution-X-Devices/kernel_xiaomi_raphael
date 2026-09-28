@@ -3,6 +3,7 @@
  * Copyright (c) 2015-2021, The Linux Foundation. All rights reserved.
  */
 
+#include <linux/pinctrl/consumer.h>
 #include "nfc_common.h"
 
 /**
@@ -329,6 +330,27 @@ int nfc_i2c_dev_probe(struct i2c_client *client, const struct i2c_device_id *id)
 		pr_err("%s: unable to request nfc clkreq gpio [%d]\n",
 		       __func__, nfc_gpio.clkreq);
 		goto err_free_dwl_req;
+	}
+
+	/*
+	 * The DT pin states are named nfc_active/nfc_suspend, so the pinctrl
+	 * core doesn't apply them on its own. Without nfc_active the IRQ and
+	 * CLKREQ pins keep their reset configuration (no pull-up on the IRQ
+	 * line), which the old nq-nci driver used to set up at probe.
+	 */
+	{
+		struct pinctrl *pctrl = devm_pinctrl_get(&client->dev);
+
+		if (!IS_ERR_OR_NULL(pctrl)) {
+			struct pinctrl_state *active =
+				pinctrl_lookup_state(pctrl, "nfc_active");
+
+			if (!IS_ERR_OR_NULL(active)) {
+				if (pinctrl_select_state(pctrl, active))
+					pr_err("%s: failed to select nfc_active\n",
+					       __func__);
+			}
+		}
 	}
 
 	nfc_dev->gpio.ven = nfc_gpio.ven;

@@ -1196,7 +1196,6 @@ struct sde_hw_intr *sde_hw_intr_init(void __iomem *addr,
 	u32 irq_map_count = 0;
 	u32 size;
 	int ret = 0;
-	int i;
 
 	if (!addr || !m) {
 		ret = -EINVAL;
@@ -1260,14 +1259,6 @@ struct sde_hw_intr *sde_hw_intr_init(void __iomem *addr,
 	ret = _sde_hw_intr_init_irq_tables(intr, m);
 	if (ret)
 		goto exit;
-
-	for (i = 0; i < min(30, (int)intr->sde_irq_map_size); i++)
- 		pr_err("sde_irq_map[%d]: type=%d inst=%d mask=0x%x reg=%d\n",
-			i,
-			intr->sde_irq_map[i].intr_type,
-			intr->sde_irq_map[i].instance_idx,
-			intr->sde_irq_map[i].irq_mask,
-			intr->sde_irq_map[i].reg_idx);
 
 	intr->cache_irq_mask = kcalloc(intr->sde_irq_size,
 			sizeof(*intr->cache_irq_mask), GFP_KERNEL);

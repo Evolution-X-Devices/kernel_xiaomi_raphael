@@ -11,11 +11,6 @@
 #include "sde_formats.h"
 #include "sde_trace.h"
 
-#define SDE_INFO_CMDENC(e, fmt, ...) SDE_INFO("enc%d intf%d " fmt, \
-		(e) && (e)->base.parent ? \
-		(e)->base.parent->base.id : -1, \
-		(e) ? (e)->base.intf_idx - INTF_0 : -1, ##__VA_ARGS__)
-
 #define SDE_DEBUG_CMDENC(e, fmt, ...) SDE_DEBUG("enc%d intf%d " fmt, \
 		(e) && (e)->base.parent ? \
 		(e)->base.parent->base.id : -1, \
@@ -29,8 +24,6 @@
 #define to_sde_encoder_phys_cmd(x) \
 	container_of(x, struct sde_encoder_phys_cmd, base)
 
-#undef SDE_DEBUG_CMDENC
-#define SDE_DEBUG_CMDENC SDE_INFO_CMDENC
 /*
  * Tearcheck sync start and continue thresholds are empirically found
  * based on common panels In the future, may want to allow panels to override

@@ -6,7 +6,6 @@
 #include <linux/lockdep.h>
 #include <linux/slab.h>
 #include <linux/string.h>
-#include "feature/selinux_hide.c"
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
 #include <uapi/linux/sched/types.h>
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
@@ -59,16 +58,24 @@ extern int avc_ss_reset(struct selinux_avc *avc, u32 seqno);
 // reset avc cache table, otherwise the new rules will not take effect if already denied
 static void reset_avc_cache()
 {
+	#if defined(KSU_COMPAT_USE_SELINUX_STATE)
+	u32 seqno = selinux_state.ss ? ++selinux_state.ss->latest_granting : 1;
+	#else
+	/* 4.9: no selinux_state; use a monotonic local seqno for AVC/policyload notifications */
+	static u32 ksu_avc_seqno = 1;
+	u32 seqno = ++ksu_avc_seqno;
+	#endif
+
 #if ((!defined(KSU_COMPAT_USE_SELINUX_STATE)) || \
 	LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
-    avc_ss_reset(0);
-    selnl_notify_policyload(0);
-    selinux_status_update_policyload(0);
+    avc_ss_reset(seqno);
+    selnl_notify_policyload(seqno);
+    selinux_status_update_policyload(seqno);
 #else
     struct selinux_avc *avc = selinux_state.avc;
-    avc_ss_reset(avc, 0);
-    selnl_notify_policyload(0);
-    selinux_status_update_policyload(&selinux_state, 0);
+    avc_ss_reset(avc, seqno);
+    selnl_notify_policyload(seqno);
+    selinux_status_update_policyload(&selinux_state, seqno);
 #endif
     selinux_xfrm_notify_policyload();
 }
@@ -94,7 +101,7 @@ static inline cpumask_t *ksu_get_current_cpumask_t() { return &current->cpus_all
 
 static int apply_kernelsu_rules_fn(void *ptr)
 {
-    struct policydb *db = (struct policydb *)ptr;
+	struct policydb *db = (struct policydb *)ptr;
 
     ksu_type(db, KERNEL_SU_DOMAIN, "domain");
     ksu_permissive(db, KERNEL_SU_DOMAIN);
@@ -118,12 +125,33 @@ static int apply_kernelsu_rules_fn(void *ptr)
         ksu_allowxperm(db, KERNEL_SU_DOMAIN, ALL, "file", ALL);
     }
 
+    // we need to save allowlist in /data/adb/ksu
+    ksu_allow(db, "kernel", "adb_data_file", "dir", ALL);
+    ksu_allow(db, "kernel", "adb_data_file", "file", ALL);
+    // we need to search /data/app
+    ksu_allow(db, "kernel", "apk_data_file", "file", "open");
+    ksu_allow(db, "kernel", "apk_data_file", "dir", "open");
+    ksu_allow(db, "kernel", "apk_data_file", "dir", "read");
+    ksu_allow(db, "kernel", "apk_data_file", "dir", "search");
+    // we may need to do mount on shell
+    ksu_allow(db, "kernel", "shell_data_file", "file", ALL);
+    // we need to read /data/system/packages.list
+    ksu_allow(db, "kernel", "kernel", "capability", "dac_override");
+    // Android 10+:
+    // http://aospxref.com/android-12.0.0_r3/xref/system/sepolicy/private/file_contexts#512
+    ksu_allow(db, "kernel", "packages_list_file", "file", ALL);
+    // Kernel 4.4
+    ksu_allow(db, "kernel", "packages_list_file", "dir", ALL);
+    // Android 9-:
+    // http://aospxref.com/android-9.0.0_r61/xref/system/sepolicy/private/file_contexts#360
+    ksu_allow(db, "kernel", "system_data_file", "file", ALL);
+    ksu_allow(db, "kernel", "system_data_file", "dir", ALL);
     // our ksud triggered by init
-    ksu_allow(db, "init", KERNEL_SU_DOMAIN, ALL, ALL);
-
-    // restored from https://github.com/tiann/KernelSU/pull/3031
     ksu_allow(db, "init", "adb_data_file", "file", ALL);
     ksu_allow(db, "init", "adb_data_file", "dir", ALL); // #1289
+    ksu_allow(db, "init", KERNEL_SU_DOMAIN, ALL, ALL);
+    // we need to umount modules in zygote
+    ksu_allow(db, "zygote", "adb_data_file", "dir", "search");
 
     // copied from Magisk rules
     // suRights
@@ -165,13 +193,17 @@ static int apply_kernelsu_rules_fn(void *ptr)
     ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "file", "open");
     ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "process", "getattr");
 
+    // For mounting loop devices, mirrors, tmpfs
+    ksu_allow(db, "kernel", ALL, "file", "read");
+    ksu_allow(db, "kernel", ALL, "file", "write");
+
     // Allow all binder transactions
     ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "binder", ALL);
 
     // Allow system server kill su process
     ksu_allow(db, "system_server", KERNEL_SU_DOMAIN, "process", "getpgid");
     ksu_allow(db, "system_server", KERNEL_SU_DOMAIN, "process", "sigkill");
-    
+
     return 0;
 }
 
@@ -204,64 +236,39 @@ out_unlock:
 	mutex_unlock(&selinux_state.policy_mutex);
 #else
 
-	cpumask_t old_mask;
 	db = get_policydb();
 	rwlock_t *lock = ksu_get_policy_rwlock();
-	
+
 	if (!lock)
 		goto do_stop_machine;
 
 	/*
-	 * HACK: write_lock() is held with preempt enabled. DO NOT let the
-	 * task be migrated to any other CPU than the current CPU. And since
-	 * set_cpus_allowed_ptr() can sleep, use raw_smp_processor_id() to get
-	 * current CPU and bypass preemption checks.
+	 * write_lock() already disables preemption; keep it disabled for the
+	 * whole run. Readers take policy_rwlock with preemption off, so a single
+	 * preemption or sleep while the write side is held deadlocks every CPU
+	 * that reaches security_compute_av() (6-way soft lockup + RCU stall).
+	 * Nothing below may sleep - allocations must be GFP_ATOMIC.
 	 */
-	cpumask_copy(&old_mask, ksu_get_current_cpumask_t());
-	set_cpus_allowed_ptr(current, cpumask_of(raw_smp_processor_id()));
-
 	write_lock(lock);
-	preempt_enable();
-
-    // we do this dance since both kernel and userspace can trigger this
-	if (likely(current && current->mm))
-		goto has_current_mm;
 
 	apply_kernelsu_rules_fn((void *)db);
-	goto out_unlock;
 
-has_current_mm:
-	;
-
-    // HACK: raise priority of this to the heavens
-	int old_policy = current->policy;
-	struct sched_param old_param = { .sched_priority = current->rt_priority };
-	struct sched_param new_param = { .sched_priority = 50 };
-
-	sched_setscheduler_nocheck(current, 1, &new_param); // raise, fifo, 50
-	apply_kernelsu_rules_fn((void *)db);
-	sched_setscheduler_nocheck(current, old_policy, &old_param); // restore
-
-out_unlock:
-	preempt_disable();
 	write_unlock(lock);
-	set_cpus_allowed_ptr(current, &old_mask);
-	goto out_flush;
+	/*
+	 * ksu_policydb_fixup_len() takes a GFP_KERNEL kvmalloc(), so it must run
+	 * with the write lock released: sleeping while the write side is held is
+	 * exactly what deadlocks readers in security_compute_av().
+	 */
+	ksu_policydb_fixup_len(db, "apply_kernelsu_rules");
+	goto out_reset_avc;
 
 do_stop_machine:
 	stop_machine(apply_kernelsu_rules_fn, (void *)db, NULL);
+	ksu_policydb_fixup_len(db, "apply_kernelsu_rules");
 
-out_flush:
+out_reset_avc:
 	smp_mb();
 	reset_avc_cache();
-#ifdef CONFIG_KSU_SUSFS
-    // Allow umount in zygote process without installing zygisk
-    //ksu_allow(db, "zygote", "labeledfs", "filesystem", "unmount");
-    susfs_set_priv_app_sid();
-    susfs_set_init_sid();
-    susfs_set_ksu_sid();
-    susfs_set_zygote_sid();
-#endif // #ifdef CONFIG_KSU_SUSFS
 #endif
 }
 
@@ -619,7 +626,6 @@ int handle_sepolicy(void __user *user_data, u64 data_len)
 			pr_err("sepol: cmd #%u failed, cmd=%u subcmd=%u.\n", cmd_index, header.cmd, header.subcmd);
 		} else {
 			success_cmd_count++;
-            ksu_add_shit_to_list(header.cmd, args);
 		}
 		cmd_index++;
 	}
@@ -696,8 +702,9 @@ static int handle_sepolicy_fn(void *data)
 			pr_err("sepol: cmd #%u failed, cmd=%u subcmd=%u.\n", cmd_index, header.cmd, header.subcmd);
 		else {
 			success_cmd_count++;
-            ksu_add_shit_to_list(header.cmd, args);
 		}
+
+		ret = 0;
 
 		cmd_index++;
 	}
@@ -712,7 +719,6 @@ int handle_sepolicy(void __user *user_data, u64 data_len)
 	u8 *payload;
 	int ret = 0;
 	int success_cmd_count = 0;
-	cpumask_t old_mask;
 
 	if (!user_data || !data_len)
 		return -EINVAL;
@@ -743,49 +749,37 @@ int handle_sepolicy(void __user *user_data, u64 data_len)
 		goto do_stop_machine;
 
 	/*
-	 * HACK: write_lock() is held with preempt enabled. DO NOT let the
-	 * task be migrated to any other CPU than the current CPU. And since
-	 * set_cpus_allowed_ptr() can sleep, use raw_smp_processor_id() to get
-	 * current CPU and bypass preemption checks.
+	 * write_lock() already disables preemption; keep it disabled for the
+	 * whole batch. Readers take policy_rwlock with preemption off, so a
+	 * single preemption or sleep while the write side is held deadlocks
+	 * every CPU that reaches security_compute_av() (6-way soft lockup +
+	 * RCU stall). Nothing below may sleep - allocations are GFP_ATOMIC.
 	 */
-	cpumask_copy(&old_mask, ksu_get_current_cpumask_t());
-	set_cpus_allowed_ptr(current, cpumask_of(raw_smp_processor_id()));
-
 	write_lock(lock);
-	preempt_enable();
-
-	if (likely(current && current->mm))
-		goto has_current_mm;
 
 	ret = handle_sepolicy_fn((void *)&ctx);
-	goto out_unlock;
 
-has_current_mm:
-	;
-
-	int old_policy = current->policy;
-	struct sched_param old_param = { .sched_priority = current->rt_priority };
-	struct sched_param new_param = { .sched_priority = 50 };
-
-	sched_setscheduler_nocheck(current, 1, &new_param);
-	ret = handle_sepolicy_fn((void *)&ctx);
-	sched_setscheduler_nocheck(current, old_policy, &old_param);
-
-out_unlock:
-	preempt_disable();
 	write_unlock(lock);
-	set_cpus_allowed_ptr(current, &old_mask);
+	/* See apply_kernelsu_rules(): fixup_len may sleep, keep it unlocked. */
+	ksu_policydb_fixup_len(get_policydb(), "handle_sepolicy");
 	goto out_done;
 
 do_stop_machine:
 	ret = stop_machine(handle_sepolicy_fn, (void *)&ctx, NULL);
+	ksu_policydb_fixup_len(get_policydb(), "handle_sepolicy");
 
 out_done:
+	smp_mb();
+	/*
+	 * Always flush. The legacy path applies rules in place with no
+	 * rollback, so a partially failed batch still mutated the policydb and
+	 * a stale AVC cache would keep serving the pre-batch decisions.
+	 */
+	reset_avc_cache();
+
 	if (ret)
 		goto out_free;
 
-	smp_mb();
-	reset_avc_cache();
 	ret = success_cmd_count;
 
 out_free:

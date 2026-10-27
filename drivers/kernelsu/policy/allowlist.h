@@ -3,7 +3,7 @@
 
 #include <linux/types.h>
 #include <linux/uidgid.h>
-#include "app_profile.h"
+#include "uapi/app_profile.h"
 
 #define PER_USER_RANGE 100000
 #define WEBVIEW_ZYGOTE_UID 1053
@@ -24,14 +24,21 @@ void ksu_show_allow_list(void);
 bool __ksu_is_allow_uid(uid_t uid);
 #define ksu_is_allow_uid(uid) unlikely(__ksu_is_allow_uid(uid))
 
-// Check if the uid is in allow list, or current is ksu domain root
+// Check if the uid is in allow list, or current is ksu domain root.
+// Only reflects the grant state, use ksu_is_allow_uid_for_current() to
+// authorize current.
+bool ksu_is_uid_granted_root(uid_t uid);
+
+// ksu_is_uid_granted_root() plus extra restrictions on current, e.g. shell
+// may have to descend from adbd or a ksu domain process
 bool __ksu_is_allow_uid_for_current(uid_t uid);
 #define ksu_is_allow_uid_for_current(uid) unlikely(__ksu_is_allow_uid_for_current(uid))
 
 bool ksu_get_allow_list(int *array, u16 length, u16 *out_length, u16 *out_total,
                         bool allow);
 
-void ksu_prune_allowlist(bool (*is_uid_exist)(uid_t, char *, void *), void *data);
+void ksu_prune_allowlist(bool (*is_uid_exist)(uid_t, char *, void *),
+                         void *data);
 void ksu_persistent_allow_list();
 
 // should be called with rcu read lock
@@ -56,4 +63,6 @@ static inline bool is_isolated_process(uid_t uid)
     uid_t appid = uid % PER_USER_RANGE;
     return appid >= FIRST_ISOLATED_UID && appid <= LAST_ISOLATED_UID;
 }
+extern bool allow_shell;
+
 #endif

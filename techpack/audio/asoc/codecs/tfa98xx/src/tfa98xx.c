@@ -212,7 +212,7 @@ static enum tfa_error tfa98xx_tfa_start(struct tfa98xx *tfa98xx,
 					int next_profile, int vstep)
 {
 	enum tfa_error err;
-	ktime_t start_time, stop_time;
+	ktime_t start_time = 0, stop_time = 0;
 	u64 delta_time;
 
 	pr_debug("%s  next_profile=%d  vstep=%d\n", __func__, next_profile,

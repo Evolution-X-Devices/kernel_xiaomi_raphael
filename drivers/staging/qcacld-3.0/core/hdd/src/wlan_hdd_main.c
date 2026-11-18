@@ -30,10 +30,23 @@
 #include <wlan_hdd_includes.h>
 #include <cds_api.h>
 #include <cds_sched.h>
+#include "../../wma/inc/wma_frame_inject.h"
+
+/*
+ * Minimal radiotap header layout. Avoid including net/ieee80211_radiotap.h:
+ * its IEEE80211_CHAN_* macros collide with wlan headers pulled in here.
+ */
+struct hdd_minimal_radiotap_header {
+	uint8_t it_version;
+	uint8_t it_pad;
+	__le16 it_len;
+	__le32 it_present;
+};
 #include <linux/cpu.h>
 #include <linux/etherdevice.h>
 #include <linux/firmware.h>
 #include <linux/kernel.h>
+#include <linux/pid.h>
 #include <wlan_hdd_tx_rx.h>
 #include <wni_api.h>
 #include <wlan_hdd_cfg.h>
@@ -2621,6 +2634,11 @@ static void hdd_mon_turn_off_ps_and_wow(struct hdd_context *hdd_ctx)
  *
  * Return: 0 for success; non-zero for failure
  */
+#ifdef FEATURE_MONITOR_MODE_SUPPORT
+static int hdd_inject_get_tx_vdev_id(struct hdd_context *hdd_ctx,
+				     bool rtnl_held);
+#endif
+
 static int __hdd_mon_open(struct net_device *dev)
 {
 	int ret;
@@ -2660,6 +2678,20 @@ static int __hdd_mon_open(struct net_device *dev)
 
 	if (!ret)
 		ret = hdd_enable_monitor_mode(dev);
+
+	/* Monitor mode was RX-only: bring up carrier and TX queues so the
+	 * injection xmit hook can be reached.
+	 */
+	if (!ret)
+		wlan_hdd_netif_queue_control(adapter,
+			WLAN_START_ALL_NETIF_QUEUE_N_CARRIER,
+			WLAN_CONTROL_PATH);
+
+	/* Create the hidden STA vdev here, in process/RTNL context, rather
+	 * than on the first monitor TX in softirq context.
+	 */
+	if (!ret)
+		(void)hdd_inject_get_tx_vdev_id(hdd_ctx, true);
 
 	if (!ret) {
 		hdd_set_current_throughput_level(hdd_ctx,
@@ -4858,11 +4890,110 @@ static const struct net_device_ops wlan_drv_ops = {
 };
 
 #ifdef FEATURE_MONITOR_MODE_SUPPORT
-/* Monitor mode net_device_ops, doesnot Tx and most of operations. */
+
+/* Cached vdev id of the hidden injection-only STA adapter, or -1. */
+static int g_hdd_inject_tx_vdev_id = -1;
+
+/*
+ * The hidden injection adapter is destroyed with the monitor adapters during
+ * a mode change. Drop the cached id so the next monitor open recreates it
+ * instead of returning a stale vdev id.
+ */
+static void hdd_inject_reset_tx_vdev_id(void)
+{
+	if (g_hdd_inject_tx_vdev_id >= 0)
+		hdd_info("wma_inject: clearing cached tx vdev %d",
+			 g_hdd_inject_tx_vdev_id);
+	g_hdd_inject_tx_vdev_id = -1;
+}
+
+/**
+ * hdd_inject_get_tx_vdev_id() - get/create a real non-monitor vdev for TX
+ * @hdd_ctx: global HDD context
+ *
+ * Firmware silently drops management TX from a monitor-type vdev. Create a
+ * hidden, fully initialized STA adapter through the driver's normal adapter
+ * path and borrow its vdev id for injected frames.
+ *
+ * Return: vdev id, or -1 on failure
+ */
+static int hdd_inject_get_tx_vdev_id(struct hdd_context *hdd_ctx,
+				     bool rtnl_held)
+{
+	struct hdd_adapter *inj_adapter;
+	uint8_t *mac_addr;
+
+	if (g_hdd_inject_tx_vdev_id >= 0)
+		return g_hdd_inject_tx_vdev_id;
+
+	mac_addr = wlan_hdd_get_intf_addr(hdd_ctx, QDF_STA_MODE);
+	if (!mac_addr) {
+		hdd_err("wma_inject: no free MAC address for injection adapter");
+		return -1;
+	}
+
+	inj_adapter = hdd_open_adapter(hdd_ctx, QDF_STA_MODE, "wlan_inj%d",
+				       mac_addr, NET_NAME_UNKNOWN, rtnl_held);
+	if (!inj_adapter) {
+		hdd_err("wma_inject: hdd_open_adapter failed");
+		wlan_hdd_release_intf_addr(hdd_ctx, mac_addr);
+		return -1;
+	}
+
+	if (hdd_start_adapter(inj_adapter)) {
+		hdd_err("wma_inject: hdd_start_adapter failed");
+		return -1;
+	}
+
+	g_hdd_inject_tx_vdev_id = inj_adapter->vdev_id;
+	hdd_debug("wma_inject: injection tx vdev ready, vdev_id=%d",
+		  g_hdd_inject_tx_vdev_id);
+	return g_hdd_inject_tx_vdev_id;
+}
+
+/**
+ * hdd_mon_hard_start_xmit() - inject a raw 802.11 frame from monitor mode
+ * @skb: frame including radiotap header
+ * @dev: monitor-mode net_device
+ *
+ * Return: NETDEV_TX_OK
+ */
+static netdev_tx_t hdd_mon_hard_start_xmit(struct sk_buff *skb,
+					   struct net_device *dev)
+{
+	struct hdd_adapter *adapter = WLAN_HDD_GET_PRIV_PTR(dev);
+	struct hdd_context *hdd_ctx = WLAN_HDD_GET_CTX(adapter);
+	void *wma_handle = cds_get_context(QDF_MODULE_ID_WMA);
+	struct hdd_minimal_radiotap_header *rtap;
+	uint32_t rtap_len;
+	int tx_vdev_id;
+
+	if (!wma_handle || skb->len < sizeof(*rtap))
+		goto drop;
+
+	rtap = (struct hdd_minimal_radiotap_header *)skb->data;
+	rtap_len = qdf_le16_to_cpu(rtap->it_len);
+	if (rtap_len >= skb->len)
+		goto drop;
+
+	tx_vdev_id = hdd_inject_get_tx_vdev_id(hdd_ctx, false);
+	if (tx_vdev_id < 0)
+		goto drop;
+
+	wma_inject_frame_via_vdev(wma_handle, (uint8_t)tx_vdev_id,
+				  skb->data + rtap_len, skb->len - rtap_len);
+
+drop:
+	kfree_skb(skb);
+	return NETDEV_TX_OK;
+}
+
+/* Monitor mode net_device_ops. RX-only upstream; injection xmit added. */
 static const struct net_device_ops wlan_mon_drv_ops = {
 	.ndo_open = hdd_mon_open,
 	.ndo_stop = hdd_stop,
 	.ndo_get_stats = hdd_get_stats,
+	.ndo_start_xmit = hdd_mon_hard_start_xmit,
 };
 
 #ifdef WLAN_FEATURE_TSF_PTP
@@ -7998,6 +8129,20 @@ QDF_STATUS hdd_start_all_adapters(struct hdd_context *hdd_ctx)
 
 	hdd_for_each_adapter_dev_held_safe(hdd_ctx, adapter, next_adapter,
 					   dbgid) {
+#ifdef FEATURE_MONITOR_MODE_SUPPORT
+		/* The hidden injection adapter never brings its netdev up, so
+		 * the normal interface-up gate would skip it after SSR.
+		 */
+		if (g_hdd_inject_tx_vdev_id >= 0 &&
+		    !strncmp(adapter->dev->name, "wlan_inj", 8)) {
+			hdd_start_adapter(adapter);
+			g_hdd_inject_tx_vdev_id = adapter->vdev_id;
+			hdd_debug("wma_inject: revived injection vdev after SSR, vdev_id=%d",
+				  g_hdd_inject_tx_vdev_id);
+			hdd_adapter_dev_put_debug(adapter, dbgid);
+			continue;
+		}
+#endif
 		if (!hdd_is_interface_up(adapter) &&
 		    adapter->device_mode != QDF_NDI_MODE) {
 			hdd_adapter_dev_put_debug(adapter, dbgid);
@@ -16214,6 +16359,7 @@ static void hdd_stop_present_mode(struct hdd_context *hdd_ctx,
 		hdd_info("Release wakelock for monitor mode!");
 		qdf_wake_lock_release(&hdd_ctx->monitor_mode_wakelock,
 				      WIFI_POWER_EVENT_WAKELOCK_MONITOR_MODE);
+		hdd_inject_reset_tx_vdev_id();
 		/* fallthrough */
 	case QDF_GLOBAL_MISSION_MODE:
 	case QDF_GLOBAL_FTM_MODE:
@@ -16398,7 +16544,8 @@ static int __hdd_driver_mode_change(struct hdd_context *hdd_ctx,
 	return 0;
 }
 
-static int hdd_driver_mode_change(enum QDF_GLOBAL_MODE mode)
+static int hdd_driver_mode_change_common(enum QDF_GLOBAL_MODE mode,
+					 bool wait)
 {
 	struct osif_driver_sync *driver_sync;
 	struct hdd_context *hdd_ctx;
@@ -16407,9 +16554,22 @@ static int hdd_driver_mode_change(enum QDF_GLOBAL_MODE mode)
 
 	hdd_enter();
 
-	status = osif_driver_sync_trans_start_wait(&driver_sync);
+	/*
+	 * The wait variant is used by the con_mode sysfs path, which must
+	 * preserve the existing blocking semantics.  The watchdog uses the
+	 * non-blocking variant so it can back off instead of queueing a
+	 * revert behind an in-flight user transition.
+	 */
+	if (wait)
+		status = osif_driver_sync_trans_start_wait(&driver_sync);
+	else
+		status = osif_driver_sync_trans_start(&driver_sync);
 	if (QDF_IS_STATUS_ERROR(status)) {
-		hdd_err("Failed to start 'mode change'; status:%u", status);
+		if (!wait && status == QDF_STATUS_E_AGAIN)
+			hdd_info_rl("Mode change transition busy; deferring");
+		else
+			hdd_err("Failed to start 'mode change'; status:%u",
+				status);
 		errno = qdf_status_to_os_return(status);
 		goto exit;
 	}
@@ -16421,6 +16581,17 @@ static int hdd_driver_mode_change(enum QDF_GLOBAL_MODE mode)
 	if (errno)
 		goto trans_stop;
 
+	/*
+	 * The watchdog must not start a full driver stop/restart while the
+	 * wiphy is suspended.  Re-check here as well: the suspend flag can
+	 * change between the caller's check and this point.
+	 */
+	if (!wait && hdd_ctx->is_wiphy_suspended) {
+		hdd_info_rl("Mode change deferred: wiphy suspended");
+		errno = -EAGAIN;
+		goto trans_stop;
+	}
+
 	errno = __hdd_driver_mode_change(hdd_ctx, mode);
 
 trans_stop:
@@ -16430,6 +16601,528 @@ exit:
 	hdd_exit();
 
 	return errno;
+}
+
+static int hdd_driver_mode_change(enum QDF_GLOBAL_MODE mode)
+{
+	return hdd_driver_mode_change_common(mode, true);
+}
+
+static int hdd_driver_mode_change_nowait(enum QDF_GLOBAL_MODE mode)
+{
+	return hdd_driver_mode_change_common(mode, false);
+}
+
+/*
+ * Owly monitor owner watchdog.
+ *
+ * The app writes its PID to /sys/module/wlan/parameters/owly_owner_pid while
+ * AirDrop mode is active. If the app process disappears (force-stop, crash,
+ * LMK), the driver returns to mission mode so normal Wi-Fi can recover.
+ *
+ * Ownership is versioned: every write to owly_owner_pid (new PID or 0) bumps
+ * owly_owner_generation.  A callback only acts if both the captured pid
+ * pointer and generation still match the current registration, so a work item
+ * queued for an old owner can never revert a new owner's monitor session.
+ *
+ * A single delayed work drives an explicit state machine:
+ *
+ *   IDLE      - no owner registered
+ *   POLLING   - owner registered, check liveness every OWLY_OWNER_POLL_MS
+ *   GRACE     - owner is gone; defer the revert and re-check owner,
+ *               generation and con_mode every OWLY_OWNER_GRACE_STEP_MS until
+ *               OWLY_OWNER_GRACE_MS expires
+ *   REVERTING - a revert attempt is in flight or waiting for a bounded retry
+ *
+ * The grace window is deliberately longer than the root watchdog's exit path
+ * (svc wifi disable, sleep 2, con_mode=0).  If userspace restores mission mode
+ * first, the kernel stops without touching the driver.  The kernel only forces
+ * the revert if con_mode is still monitor at the deadline.
+ */
+#define OWLY_OWNER_POLL_MS 1000
+#define OWLY_OWNER_GRACE_MS 7000
+#define OWLY_OWNER_GRACE_STEP_MS 500
+#define OWLY_OWNER_REVERT_RETRY_MS 1000
+#define OWLY_OWNER_REVERT_MAX_ATTEMPTS 3
+#define OWLY_OWNER_SUSPEND_RETRY_MS 5000
+
+enum owly_owner_state {
+	OWLY_OWNER_IDLE,
+	OWLY_OWNER_POLLING,
+	OWLY_OWNER_GRACE,
+	OWLY_OWNER_REVERTING,
+};
+
+static DEFINE_MUTEX(owly_owner_lock);
+static struct pid *owly_owner_pid;
+static int owly_owner_pid_nr;
+static unsigned long owly_owner_generation;
+static enum owly_owner_state owly_owner_state;
+static unsigned long owly_grace_deadline;
+static unsigned int owly_revert_attempt;
+static struct delayed_work owly_owner_work;
+static struct workqueue_struct *owly_owner_wq;
+
+/*
+ * hdd_driver_mode_change() performs a full driver stop/restart and can sleep
+ * for a long time.  Keep it on a dedicated ordered workqueue instead of
+ * system_wq so it neither delays unrelated system work nor races the state
+ * machine.  The workqueue is deliberately not WQ_FREEZABLE: a frozen worker
+ * would make the sysfs set path's asynchronous cancel ineffective until thaw.
+ * Fall back to system_wq only if allocation fails.
+ */
+static void owly_owner_rearm(unsigned long delay_ms)
+{
+	if (owly_owner_wq)
+		queue_delayed_work(owly_owner_wq, &owly_owner_work,
+				   msecs_to_jiffies(delay_ms));
+	else
+		schedule_delayed_work(&owly_owner_work,
+				      msecs_to_jiffies(delay_ms));
+}
+
+/* Caller must hold owly_owner_lock. */
+static bool owly_owner_matches_locked(struct pid *pid,
+				      unsigned long generation,
+				      enum owly_owner_state state)
+{
+	return owly_owner_pid == pid &&
+	       owly_owner_generation == generation &&
+	       owly_owner_state == state;
+}
+
+static void owly_owner_poll_step(struct pid *pid, unsigned long generation)
+{
+	struct hdd_context *hdd_ctx;
+	struct task_struct *task;
+	bool alive;
+
+	hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
+	if (hdd_ctx && hdd_ctx->is_wiphy_suspended) {
+		/*
+		 * Defensive only: monitor mode holds monitor_mode_wakelock,
+		 * so this should be unreachable.  Do not poll or start a
+		 * grace/revert while the wiphy is suspended; retry later.
+		 */
+		hdd_info_rl("Owly owner poll deferred: wiphy suspended");
+		owly_owner_rearm(OWLY_OWNER_SUSPEND_RETRY_MS);
+		return;
+	}
+
+	task = get_pid_task(pid, PIDTYPE_PID);
+	/*
+	 * A zombie still has a task_struct until it is reaped.  Do not report
+	 * it as a live owner: exit_state is set as soon as do_exit() runs.
+	 */
+	alive = task && !READ_ONCE(task->exit_state);
+	if (task)
+		put_task_struct(task);
+
+	mutex_lock(&owly_owner_lock);
+	if (!owly_owner_matches_locked(pid, generation, OWLY_OWNER_POLLING)) {
+		mutex_unlock(&owly_owner_lock);
+		return;
+	}
+
+	if (alive) {
+		mutex_unlock(&owly_owner_lock);
+		owly_owner_rearm(OWLY_OWNER_POLL_MS);
+		return;
+	}
+
+	owly_owner_state = OWLY_OWNER_GRACE;
+	owly_grace_deadline = jiffies + msecs_to_jiffies(OWLY_OWNER_GRACE_MS);
+	mutex_unlock(&owly_owner_lock);
+
+	hdd_info("Owly owner exited; deferring revert for %d ms",
+		 OWLY_OWNER_GRACE_MS);
+	owly_owner_rearm(OWLY_OWNER_GRACE_STEP_MS);
+}
+
+static void owly_owner_grace_step(struct pid *pid, unsigned long generation)
+{
+	struct hdd_context *hdd_ctx;
+	enum QDF_GLOBAL_MODE mode;
+	bool deadline = false;
+	bool deferred = false;
+	bool revert = false;
+	int deferred_mode = 0;
+
+	mutex_lock(&owly_owner_lock);
+	if (!owly_owner_matches_locked(pid, generation, OWLY_OWNER_GRACE)) {
+		mutex_unlock(&owly_owner_lock);
+		return;
+	}
+	deadline = time_after_eq(jiffies, owly_grace_deadline);
+	mutex_unlock(&owly_owner_lock);
+
+	mode = hdd_get_conparam();
+	if (mode != QDF_GLOBAL_MONITOR_MODE) {
+		mutex_lock(&owly_owner_lock);
+		if (owly_owner_matches_locked(pid, generation,
+					      OWLY_OWNER_GRACE)) {
+			/*
+			 * Userspace already restored mission mode.  No kernel
+			 * revert is needed, so clear the dead owner as
+			 * cleanup and stop the watchdog.
+			 */
+			put_pid(owly_owner_pid);
+			owly_owner_pid = NULL;
+			owly_owner_pid_nr = 0;
+			owly_owner_generation++;
+			owly_owner_state = OWLY_OWNER_IDLE;
+			owly_grace_deadline = 0;
+			deferred = true;
+			deferred_mode = mode;
+		}
+		mutex_unlock(&owly_owner_lock);
+		if (deferred)
+			hdd_info("Owly owner exited; userspace restored con_mode=%d, kernel deferred",
+				 deferred_mode);
+		return;
+	}
+
+	hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
+	if (hdd_ctx && hdd_ctx->is_wiphy_suspended) {
+		/*
+		 * Defensive only: monitor mode holds monitor_mode_wakelock.
+		 * Keep the owner and retry after the wiphy resumes.
+		 */
+		hdd_info_rl("Owly owner grace deferred: wiphy suspended");
+		owly_owner_rearm(OWLY_OWNER_SUSPEND_RETRY_MS);
+		return;
+	}
+
+	if (!deadline) {
+		owly_owner_rearm(OWLY_OWNER_GRACE_STEP_MS);
+		return;
+	}
+
+	mutex_lock(&owly_owner_lock);
+	if (owly_owner_matches_locked(pid, generation, OWLY_OWNER_GRACE)) {
+		owly_owner_state = OWLY_OWNER_REVERTING;
+		owly_revert_attempt = 1;
+		revert = true;
+	}
+	mutex_unlock(&owly_owner_lock);
+
+	if (revert) {
+		hdd_info("Owly owner still gone after %d ms; starting revert",
+			 OWLY_OWNER_GRACE_MS);
+		owly_owner_rearm(0);
+	}
+}
+
+static void owly_owner_revert_step(struct pid *pid, unsigned long generation)
+{
+	struct hdd_context *hdd_ctx;
+	enum QDF_GLOBAL_MODE mode;
+	unsigned int attempt;
+	int ret;
+	bool retry = false;
+	bool clear = false;
+	bool success = false;
+	bool deferred = false;
+	int deferred_mode = 0;
+	unsigned long delay = 0;
+
+	mutex_lock(&owly_owner_lock);
+	if (!owly_owner_matches_locked(pid, generation,
+				       OWLY_OWNER_REVERTING)) {
+		mutex_unlock(&owly_owner_lock);
+		hdd_info("Owly owner changed during revert; old attempt abandoned");
+		return;
+	}
+	attempt = owly_revert_attempt;
+	mutex_unlock(&owly_owner_lock);
+
+	/*
+	 * Re-check con_mode here as well.  The grace step checked it before
+	 * handing over to this work item, but userspace can restore mission
+	 * mode in between.  Never start a driver restart if that happened.
+	 */
+	mode = hdd_get_conparam();
+	if (mode != QDF_GLOBAL_MONITOR_MODE) {
+		mutex_lock(&owly_owner_lock);
+		if (owly_owner_matches_locked(pid, generation,
+					      OWLY_OWNER_REVERTING)) {
+			put_pid(owly_owner_pid);
+			owly_owner_pid = NULL;
+			owly_owner_pid_nr = 0;
+			owly_owner_generation++;
+			owly_owner_state = OWLY_OWNER_IDLE;
+			owly_grace_deadline = 0;
+			owly_revert_attempt = 0;
+			deferred = true;
+			deferred_mode = mode;
+		}
+		mutex_unlock(&owly_owner_lock);
+		if (deferred)
+			hdd_info("Owly owner exited; userspace restored con_mode=%d, kernel deferred",
+				 deferred_mode);
+		return;
+	}
+
+	hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
+	if (hdd_ctx && hdd_ctx->is_wiphy_suspended) {
+		/*
+		 * Defensive only: monitor mode holds monitor_mode_wakelock.
+		 * Do not start a driver restart while the wiphy is suspended;
+		 * keep the owner and retry later.
+		 */
+		hdd_info_rl("Owly owner revert deferred: wiphy suspended");
+		owly_owner_rearm(OWLY_OWNER_SUSPEND_RETRY_MS);
+		return;
+	}
+
+	/*
+	 * Re-check immediately before starting the transition.  This cannot
+	 * be atomic with the call because hdd_driver_mode_change_nowait()
+	 * sleeps, but it narrows the window in which a new owner can be
+	 * replaced by an in-flight revert.
+	 */
+	mutex_lock(&owly_owner_lock);
+	if (!owly_owner_matches_locked(pid, generation,
+				       OWLY_OWNER_REVERTING)) {
+		mutex_unlock(&owly_owner_lock);
+		hdd_info("Owly owner changed during revert; old attempt abandoned");
+		return;
+	}
+	mutex_unlock(&owly_owner_lock);
+
+	hdd_info("Owly owner exited; reverting to mission mode (attempt %u/%d)",
+		 attempt, OWLY_OWNER_REVERT_MAX_ATTEMPTS);
+	ret = hdd_driver_mode_change_nowait(QDF_GLOBAL_MISSION_MODE);
+
+	mutex_lock(&owly_owner_lock);
+	if (!owly_owner_matches_locked(pid, generation,
+				       OWLY_OWNER_REVERTING)) {
+		int new_owner = owly_owner_pid_nr;
+		enum owly_owner_state new_state = owly_owner_state;
+
+		mutex_unlock(&owly_owner_lock);
+		mode = hdd_get_conparam();
+		hdd_info("Owly owner appeared during revert (pid %d, state %d, con_mode %d); not clearing or retrying",
+			 new_owner, new_state, mode);
+		return;
+	}
+
+	if (!ret) {
+		/*
+		 * Success: only now is it safe to drop the owner.  Keeping it
+		 * registered until here means a failure can be retried without
+		 * losing track of the session that needs reverting.
+		 */
+		put_pid(owly_owner_pid);
+		owly_owner_pid = NULL;
+		owly_owner_pid_nr = 0;
+		owly_owner_generation++;
+		owly_owner_state = OWLY_OWNER_IDLE;
+		owly_grace_deadline = 0;
+		owly_revert_attempt = 0;
+		clear = true;
+		success = true;
+	} else if (ret == -EAGAIN) {
+		/*
+		 * A driver transition is already active or queued (for example
+		 * the user's con_mode=4 or the root watchdog's con_mode=0).
+		 * Do not queue this revert behind it; go back to polling and
+		 * re-evaluate once that transition settles.
+		 */
+		owly_owner_state = OWLY_OWNER_POLLING;
+		owly_grace_deadline = 0;
+		owly_revert_attempt = 0;
+		retry = true;
+		delay = OWLY_OWNER_POLL_MS;
+	} else if (attempt < OWLY_OWNER_REVERT_MAX_ATTEMPTS) {
+		owly_revert_attempt = attempt + 1;
+		retry = true;
+		delay = OWLY_OWNER_REVERT_RETRY_MS;
+	} else {
+		/*
+		 * Final failure: stop retrying, but clear the dead owner so a
+		 * new app registration is not blocked by a stale one.
+		 */
+		put_pid(owly_owner_pid);
+		owly_owner_pid = NULL;
+		owly_owner_pid_nr = 0;
+		owly_owner_generation++;
+		owly_owner_state = OWLY_OWNER_IDLE;
+		owly_grace_deadline = 0;
+		owly_revert_attempt = 0;
+		clear = true;
+	}
+	mutex_unlock(&owly_owner_lock);
+
+	if (success) {
+		mode = hdd_get_conparam();
+		hdd_info("Owly owner revert succeeded; con_mode=%d; ownership cleared",
+			 mode);
+		return;
+	}
+	if (clear) {
+		mode = hdd_get_conparam();
+		hdd_err("Owly owner revert failed after %u attempts (%d); con_mode=%d; ownership cleared",
+			attempt, ret, mode);
+		return;
+	}
+	if (retry) {
+		mode = hdd_get_conparam();
+		if (ret == -EAGAIN)
+			hdd_info_rl("Owly owner revert deferred (con_mode=%d); will re-poll",
+				    mode);
+		else
+			hdd_err("Owly owner revert attempt %u failed (%d, con_mode=%d); retrying",
+				attempt, ret, mode);
+		owly_owner_rearm(delay);
+	}
+}
+
+static void owly_owner_work_fn(struct work_struct *work)
+{
+	struct pid *pid;
+	unsigned long generation;
+	enum owly_owner_state state;
+
+	mutex_lock(&owly_owner_lock);
+	pid = owly_owner_pid;
+	generation = owly_owner_generation;
+	state = owly_owner_state;
+	if (pid)
+		get_pid(pid);
+	mutex_unlock(&owly_owner_lock);
+
+	if (!pid || state == OWLY_OWNER_IDLE) {
+		put_pid(pid);
+		return;
+	}
+
+	switch (state) {
+	case OWLY_OWNER_POLLING:
+		owly_owner_poll_step(pid, generation);
+		break;
+	case OWLY_OWNER_GRACE:
+		owly_owner_grace_step(pid, generation);
+		break;
+	case OWLY_OWNER_REVERTING:
+		owly_owner_revert_step(pid, generation);
+		break;
+	case OWLY_OWNER_IDLE:
+	default:
+		break;
+	}
+
+	put_pid(pid);
+}
+
+static int owly_owner_pid_set(const char *kmessage,
+			      const struct kernel_param *kp)
+{
+	struct pid *new_pid = NULL;
+	struct pid *old_pid;
+	enum owly_owner_state old_state;
+	int nr;
+	int ret;
+
+	ret = kstrtoint(kmessage, 10, &nr);
+	if (ret)
+		return ret;
+
+	if (nr > 0) {
+		new_pid = find_get_pid(nr);
+		if (!new_pid) {
+			hdd_err("Owly owner PID %d not found; keeping owner %d",
+				nr, READ_ONCE(owly_owner_pid_nr));
+			return -ESRCH;
+		}
+	}
+
+	/*
+	 * Never use cancel_delayed_work_sync() here: this runs in the sysfs
+	 * write context and the work may be inside hdd_driver_mode_change(),
+	 * which can block for the DSC timeout.  An asynchronous cancel plus
+	 * the generation check is sufficient; a running callback will see the
+	 * new owner and abandon its old attempt.
+	 */
+	cancel_delayed_work(&owly_owner_work);
+
+	mutex_lock(&owly_owner_lock);
+	old_pid = owly_owner_pid;
+	old_state = owly_owner_state;
+	owly_owner_pid = new_pid;
+	owly_owner_pid_nr = nr > 0 ? nr : 0;
+	owly_owner_generation++;
+	owly_owner_state = new_pid ? OWLY_OWNER_POLLING : OWLY_OWNER_IDLE;
+	owly_grace_deadline = 0;
+	owly_revert_attempt = 0;
+	mutex_unlock(&owly_owner_lock);
+
+	put_pid(old_pid);
+
+	if (old_state == OWLY_OWNER_REVERTING)
+		hdd_info("Owly owner changed during revert; old attempt abandoned");
+
+	if (new_pid)
+		owly_owner_rearm(OWLY_OWNER_POLL_MS);
+
+	return 0;
+}
+
+static const struct kernel_param_ops owly_owner_pid_ops = {
+	.set = owly_owner_pid_set,
+	.get = param_get_int,
+};
+
+static void owly_owner_init(void)
+{
+	INIT_DELAYED_WORK(&owly_owner_work, owly_owner_work_fn);
+	owly_owner_wq = alloc_ordered_workqueue("owly_owner", WQ_MEM_RECLAIM);
+	if (!owly_owner_wq)
+		hdd_err("Owly owner workqueue allocation failed; using system_wq");
+}
+
+static void owly_owner_exit(void)
+{
+	struct pid *pid;
+	bool was_reverting;
+
+	/*
+	 * This path is not exercised on the current build because WLAN is
+	 * built-in (CONFIG_QCA_CLD_WLAN=y).  Keep it correct for a
+	 * hypothetical module build:
+	 *
+	 * 1. Clear ownership/state first, so a callback that is already
+	 *    running sees IDLE and does not retry or clear a new owner.
+	 * 2. Cancel the pending delayed work synchronously.  This is the only
+	 *    place where synchronous cancellation is used; the state is
+	 *    already IDLE, so a callback that is inside
+	 *    hdd_driver_mode_change() will not retry.  The wait is bounded by
+	 *    that driver call (DSC timeout), not by a retry loop.
+	 * 3. Destroy the workqueue.  destroy_workqueue() also waits for the
+	 *    in-flight callback; if the driver call itself is hung, a safe
+	 *    module unload is impossible.
+	 */
+	mutex_lock(&owly_owner_lock);
+	pid = owly_owner_pid;
+	was_reverting = (owly_owner_state == OWLY_OWNER_REVERTING);
+	owly_owner_pid = NULL;
+	owly_owner_pid_nr = 0;
+	owly_owner_generation++;
+	owly_owner_state = OWLY_OWNER_IDLE;
+	owly_grace_deadline = 0;
+	owly_revert_attempt = 0;
+	mutex_unlock(&owly_owner_lock);
+	put_pid(pid);
+
+	cancel_delayed_work_sync(&owly_owner_work);
+
+	if (was_reverting)
+		hdd_info("Owly owner exit: waiting for in-flight revert");
+
+	if (owly_owner_wq) {
+		destroy_workqueue(owly_owner_wq);
+		owly_owner_wq = NULL;
+	}
 }
 
 static int hdd_set_con_mode(enum QDF_GLOBAL_MODE mode)
@@ -16671,6 +17364,7 @@ static int hdd_module_init(void)
 {
 	int ret;
 
+	owly_owner_init();
 	ret = wlan_hdd_state_ctrl_param_create();
 	if (ret)
 		pr_err("wlan_hdd_state_create:%x\n", ret);
@@ -16687,6 +17381,7 @@ static int hdd_module_init(void)
  */
 static void __exit hdd_module_exit(void)
 {
+	owly_owner_exit();
 	hdd_driver_unload();
 }
 
@@ -18132,6 +18827,8 @@ static const struct kernel_param_ops fwpath_ops = {
 
 module_param_cb(con_mode, &con_mode_ops, &con_mode,
 		S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+
+module_param_cb(owly_owner_pid, &owly_owner_pid_ops, &owly_owner_pid_nr, 0644);
 
 module_param_cb(con_mode_ftm, &con_mode_ftm_ops, &con_mode_ftm,
 		S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);

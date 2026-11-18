@@ -1,3 +1,5 @@
+ccflags-y += -I $(srctree)/drivers/platform/msm/ipa/ipa_v3
+
 obj-$(CONFIG_IPA3) += ipahal/
 
 obj-$(CONFIG_IPA3) += ipat.o

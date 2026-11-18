@@ -4564,6 +4564,18 @@ wma_mlme_vdev_notify_down_complete(struct vdev_mlme_obj *vdev_mlme,
 		goto end;
 	}
 
+	/*
+	 * Monitor-mode teardown can deliver a stale delete-BSS response with
+	 * an invalid vdev id (255). Do not index wma->interfaces with it.
+	 */
+	if (!resp || resp->vdev_id >= WLAN_MAX_VDEVS ||
+	    !wma->interfaces[resp->vdev_id].vdev) {
+		WMA_LOGE("%s: invalid vdev_id %u", __func__,
+			 resp ? resp->vdev_id : 0xffffffff);
+		status = QDF_STATUS_E_INVAL;
+		goto end;
+	}
+
 	status = mlme_get_vdev_stop_type(wma->interfaces[resp->vdev_id].vdev,
 					 &vdev_stop_type);
 	if (QDF_IS_STATUS_ERROR(status)) {

@@ -328,7 +328,12 @@ struct ftrace_likely_data {
  *
  *  gcc: https://gcc.gnu.org/onlinedocs/gcc/Statement-Attributes.html#Statement-Attributes
  */
-#if __has_attribute(__fallthrough__)
+/*
+ * GCC 13/14 can be used to build this 4.14 tree, but __has_attribute() is
+ * not usable in the assembler/linker-script preprocessor context with the
+ * cross toolchain here. GCC 7 and newer all support the attribute.
+ */
+#if defined(__GNUC__) && (__GNUC__ >= 7)
 # define fallthrough                    __attribute__((__fallthrough__))
 #else
 # define fallthrough                    do {} while (0)  /* fallthrough */

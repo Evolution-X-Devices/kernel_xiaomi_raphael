@@ -71,7 +71,8 @@ HDD_INC_DIR :=	$(HDD_DIR)/inc
 HDD_SRC_DIR :=	$(HDD_DIR)/src
 
 HDD_INC := 	-I $(srctree)/$(WLAN_ROOT)/$(HDD_INC_DIR) \
-		-I $(srctree)/$(WLAN_ROOT)/$(HDD_SRC_DIR)
+		-I $(srctree)/$(WLAN_ROOT)/$(HDD_SRC_DIR) \
+		-I $(srctree)/$(WLAN_ROOT)/core/wma/inc
 
 HDD_OBJS := 	$(HDD_SRC_DIR)/wlan_hdd_assoc.o \
 		$(HDD_SRC_DIR)/wlan_hdd_cfg.o \
@@ -1962,6 +1963,7 @@ WMA_OBJS :=	$(WMA_SRC_DIR)/wma_main.o \
 		$(WMA_SRC_DIR)/wma_data.o \
 		$(WMA_SRC_DIR)/wma_utils.o \
 		$(WMA_SRC_DIR)/wma_features.o \
+		$(WMA_SRC_DIR)/wma_frame_inject.o \
 		$(WMA_SRC_DIR)/wlan_qct_wma_legacy.o\
 		$(WMA_NDP_OBJS)
 

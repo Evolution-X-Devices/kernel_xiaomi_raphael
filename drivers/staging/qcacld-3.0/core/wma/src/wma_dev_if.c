@@ -2787,7 +2787,7 @@ end:
 	return QDF_STATUS_E_FAILURE;
 }
 
-enum mlme_bcn_tx_rate_code wma_get_bcn_rate_code(uint16_t rate)
+uint32_t wma_get_bcn_rate_code(uint16_t rate)
 {
 	/* rate in multiples of 100 Kbps */
 	switch (rate) {
